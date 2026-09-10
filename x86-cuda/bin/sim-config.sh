@@ -35,6 +35,13 @@ exec_prefix=""; optionlist_file=""
 partition=""; allocation=""; ppn=48; num_threads=48; memory=196608; nodes=1
 maxwalltime="24:00:00"; basedir=""; sourcebasedir=""; gpus_per_task=""
 outdir=""; dry_run=""; location="unspecified"
+# SimFactory splices this into `{ <envsetup> ; } && { cd … && make … }`, so
+# an empty block is not "no setup" -- it is a bash syntax error:
+#     /bin/bash: -c: line 0: syntax error near unexpected token `;'
+#     `{ ; } && { cd /work/…/Cactus && … }'
+# `true` is the no-op that keeps the construct valid. Sites needing module
+# commands pass --envsetup "module purge; module load ...".
+envsetup="true"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +63,7 @@ while [ $# -gt 0 ]; do
         --sourcebasedir)  sourcebasedir="$2"; shift 2 ;;
         --gpus-per-task)  gpus_per_task="$2"; shift 2 ;;
         --location)       location="$2"; shift 2 ;;
+        --envsetup)       envsetup="$2"; shift 2 ;;
         --outdir)         outdir="$2"; shift 2 ;;
         --dry-run)        dry_run=1; shift ;;
         -h|--help)        sed -n '2,32p' "$0"; exit 0 ;;
@@ -87,6 +95,12 @@ case "$image" in /*) ;; *) die "--image must be an absolute path: every
          with --flavor mpich; run mpi-matrix.sh against the image to see
          which pairs actually bootstrap on this machine."
 case "$flavor" in openmpi|mpich) ;; *) die "--flavor must be openmpi or mpich, not '$flavor'" ;; esac
+
+# See the note where envsetup is defined: empty is a syntax error downstream.
+[ -n "$(printf '%s' "$envsetup" | tr -d '[:space:]')" ] \
+    || die "--envsetup must not be empty; SimFactory splices it into
+         '{ <envsetup> ; } && { ... }' and an empty block is a bash syntax
+         error. Use 'true' for no setup at all."
 
 # Cross-check the pairing rather than enforce it: unusual combinations are
 # legitimate, but an accidental mismatch is worth a word.
@@ -196,7 +210,10 @@ status          = production
 hostname        = $machine
 aliaspattern    = ^$machine
 
+# Spliced into `{ ... ; } && { cd ... && make ... }`, so it must not be
+# empty -- an empty block is a bash syntax error, not a no-op.
 envsetup        = <<EOT
+$envsetup
 EOT
 
 sourcebasedir   = $sourcebasedir
