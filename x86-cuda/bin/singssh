@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""ssh launcher that re-enters this Singularity image on the remote node.
+
+MPICH's Hydra launches remote ranks by running
+
+    <launcher-exec> [-x] <host> <command...>
+
+Plain ssh would start the command on the bare host, OUTSIDE the container,
+where the Cactus executable and its libraries do not exist -- and when the
+host happens to have its own MPI, that failure is silent rather than loud:
+ranks come up, but in the wrong environment. This wrapper substitutes
+
+    ssh <host> singularity exec [$SINGSSH_EXEC_ARGS] <image> <command...>
+
+so every rank starts inside the same image as rank 0.
+
+$SINGSSH_EXEC_ARGS carries any flags the remote `singularity exec` needs --
+in practice the same --bind and --nv flags used to enter the container in
+the first place, since those are NOT inherited by the remote invocation.
+E.g.
+
+    export SINGSSH_EXEC_ARGS="--nv --bind /work --bind /project"
+
+$SINGSSH_SSH_OPTS overrides the options passed to ssh. The default exists
+because ssh running INSIDE the container reads the *image's* /etc/ssh, not
+the host's: it therefore has neither the site's ssh_config nor any
+known_hosts, and the very first connection dies with
+
+    Host key verification failed.
+
+Hydra then waits forever for a proxy that never started, so the symptom is
+a hang rather than an error. The default is chosen for launching ranks
+within an already-granted allocation on a cluster's private network:
+
+    BatchMode=yes            never block on a prompt -- a launcher that
+                             waits for input is indistinguishable from a
+                             hung job.
+    StrictHostKeyChecking=no  the image has no known_hosts to check against.
+    UserKnownHostsFile=/dev/null
+                             do not try to write one either: every rank
+                             would race to append to the same file on a
+                             shared home.
+
+That is a deliberate loosening. Where the site's host keys are already
+known and reachable from inside the container, tighten it:
+
+    export SINGSSH_SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes"
+"""
+import glob
+import os
+import shlex
+import sys
+
+# Paths that exist only on the node we are running on. An image under one
+# of these cannot be opened by a rank on another node.
+NODE_LOCAL = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/")
+
+
+def resolve_image():
+    """Which image file should the remote node open?
+
+    $SINGSSH_IMAGE wins. Otherwise SINGULARITY_CONTAINER/APPTAINER_CONTAINER,
+    but only when it still names a real, non-node-local FILE.
+
+    That caveat is the whole reason this function exists. When the runtime
+    mounts a .sif with FUSE -- SingularityCE reports "INFO: Mounting image
+    with FUSE" -- it sets SINGULARITY_CONTAINER to the *extracted rootfs*,
+    e.g. /tmp/rootfs-2986056203/root, not to the .simg. That path is a
+    directory, private to this node, and inside this process's mount
+    namespace, so handing it to a remote `singularity exec` gives:
+
+        FATAL: While checking image: could not open image
+               /tmp/rootfs-2986056203/root: ... no such file or directory
+
+    Apptainer does not do this (it keeps the .sif path), which is why the
+    failure only shows up on some sites.
+    """
+    explicit = os.environ.get("SINGSSH_IMAGE")
+    if explicit:
+        return explicit
+
+    seen = []
+    for var in ("SINGULARITY_CONTAINER", "APPTAINER_CONTAINER"):
+        val = os.environ.get(var)
+        if not val:
+            continue
+        seen.append("%s=%s" % (var, val))
+        if os.path.isfile(val) and not val.startswith(NODE_LOCAL):
+            return val
+
+    if seen:
+        detail = ("the runtime reports\n           "
+                  + "\n           ".join(seen)
+                  + "\n         which is not a shared image file -- most likely the image was\n"
+                    "         mounted with FUSE and this is the node-local extracted rootfs.")
+    else:
+        detail = ("neither SINGULARITY_CONTAINER nor APPTAINER_CONTAINER is set;\n"
+                  "         --cleanenv strips them.")
+
+    sys.exit(
+        "singssh: cannot determine which image the remote ranks should enter:\n"
+        "         " + detail + "\n\n"
+        "         Name it explicitly, in the environment OUTSIDE the container:\n"
+        "           export SINGSSH_IMAGE=/work/sbrandt/images/cactus-cuda.simg\n"
+        "         It must be a path visible on every node in the allocation."
+    )
+
+
+image = resolve_image()
+
+# Preflight hook: mpirun.py calls this so a bad image path is reported once,
+# up front, instead of once per remote rank from inside Hydra.
+if len(sys.argv) > 1 and sys.argv[1] == "--print-image":
+    print(image)
+    sys.exit(0)
+
+argv = sys.argv[1:]
+# Hydra puts two kinds of leading argument ahead of the host name, and they
+# must be treated differently. MPICH 4.x invokes the launcher as:
+#
+#   singssh -x --external-launcher node2 "…/hydra_pmi_proxy" --control-port …
+#
+# `-x` is a real ssh flag and has to be forwarded. `--external-launcher` is
+# Hydra's own marker: ssh has no long options at all, so forwarding it gets
+# "ssh: unknown option -- -" and the remote rank never starts. MPICH 3.x did
+# not send it, which is why this only shows up on a current MPICH.
+ssh_opts = []
+while argv and argv[0].startswith("-"):
+    arg = argv.pop(0)
+    if arg.startswith("--"):
+        continue  # Hydra-internal; never an ssh option
+    ssh_opts.append(arg)
+if not argv:
+    sys.exit("singssh: no host given (usage: singssh [ssh-opts] <host> <command...>)")
+host, cmd = argv[0], argv[1:]
+
+# The remote `singularity exec` inherits none of the flags used to enter the
+# container here, and forgetting them is silent: ranks start, but without
+# /work the executable is not there, and without --nv there is no GPU.
+# So derive what can be derived, and let SINGSSH_EXEC_ARGS override it all.
+if "SINGSSH_EXEC_ARGS" in os.environ:
+    exec_args = shlex.split(os.environ["SINGSSH_EXEC_ARGS"])
+else:
+    exec_args = []
+    # The runtime does export the bind list, so this one is exact.
+    binds = os.environ.get("SINGULARITY_BIND") or os.environ.get("APPTAINER_BIND")
+    if binds:
+        exec_args += ["--bind", binds]
+    # --nv leaves no environment marker, so infer it from the device nodes
+    # it binds in. A node with /dev/nvidia* has a driver, so re-adding --nv
+    # there is safe; a node without one gets nothing.
+    if glob.glob("/dev/nvidia*"):
+        exec_args += ["--nv"]
+default_ssh_opts = ("-o BatchMode=yes "
+                    "-o StrictHostKeyChecking=no "
+                    "-o UserKnownHostsFile=/dev/null "
+                    "-o LogLevel=ERROR")
+base_opts = shlex.split(os.environ.get("SINGSSH_SSH_OPTS", default_ssh_opts))
+full_cmd = (["ssh"] + base_opts + ssh_opts
+            + [host, "singularity", "exec"] + exec_args + [image] + cmd)
+
+if os.environ.get("SINGSSH_DRY_RUN"):
+    print(" ".join(shlex.quote(a) for a in full_cmd))
+    sys.exit(0)
+
+# Replace this process with ssh rather than forking it as a child.
+#
+# A wrapper process sitting between Hydra and ssh is a liability at
+# shutdown: Hydra signals the launcher it started, and a Python parent does
+# not forward that to its ssh child, so a terminated launcher can orphan a
+# live ssh and leave the job apparently unfinished. exec removes the
+# question entirely -- there is no wrapper left to signal, ssh inherits the
+# pid Hydra knows about, and its exit status is the launcher's by
+# construction rather than by us remembering to propagate it. (The
+# prototype's bare call() discarded the status, so a rank that died looked
+# to Hydra like a rank that finished.)
+try:
+    os.execvp(full_cmd[0], full_cmd)
+except OSError as exc:
+    sys.exit("singssh: cannot exec %s: %s" % (full_cmd[0], exc))

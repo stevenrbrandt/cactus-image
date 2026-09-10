@@ -1,0 +1,63 @@
+# Two-node SLURM cluster for testing the Singularity images built in this
+# repo. Bring it up with:  docker compose up -d --build
+#
+# Then:  docker compose exec --user sbrandt node1 bash
+#
+# privileged: true is what lets Singularity run inside the container. It is a
+# real privilege grant -- this compose file is for a local test cluster on a
+# private network, not something to deploy.
+services:
+  node1:
+    build:
+      context: .
+    image: cactus-cluster-node
+    container_name: node1
+    hostname: node1
+    privileged: true
+    environment:
+      SLURM_ROLE: controller
+    volumes:
+      # The "shared filesystem". Both nodes see the same inodes here, and so
+      # does the host, which is how images and build trees get in and out.
+      - ./work:/work
+      # Shared home, like a real cluster: a tree built in ~ on one node is
+      # visible from the other. Seeded on first boot by the entrypoint.
+      - home:/home
+      # Lets load-image.sh pull straight from the host's docker daemon via
+      # apptainer's docker-daemon:// transport, with no 51GB intermediate
+      # tar. Only node1 needs it. This container is already privileged, so
+      # the socket adds no privilege it does not already have -- but it is
+      # another reason this compose file belongs nowhere near a real host.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      cluster:
+        aliases: [node1]
+    # Singularity's image handling and MPI both want more than docker's
+    # default 64MB of /dev/shm.
+    shm_size: 2gb
+
+  node2:
+    build:
+      context: .
+    image: cactus-cluster-node
+    container_name: node2
+    hostname: node2
+    privileged: true
+    environment:
+      SLURM_ROLE: compute
+    volumes:
+      - ./work:/work
+      - home:/home
+    networks:
+      cluster:
+        aliases: [node2]
+    shm_size: 2gb
+    depends_on:
+      - node1
+
+networks:
+  cluster:
+    driver: bridge
+
+volumes:
+  home:

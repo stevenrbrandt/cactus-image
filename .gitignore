@@ -1,0 +1,22 @@
+# Bind-mount targets for the containers' /home. These hold whole Cactus
+# checkouts (several GB) belonging to their own upstream repositories.
+# The directories themselves are kept, so that docker does not create them
+# root-owned on first `docker compose up`.
+x86-cpu/home/*
+x86-cuda/home/*
+!x86-cpu/home/.gitkeep
+!x86-cuda/home/.gitkeep
+
+# The test cluster's shared filesystem: converted .sif images, build trees,
+# apptainer scratch, generated mdb trees, logs. All reproducible.
+cluster/work/*
+!cluster/work/.gitkeep
+
+# Container images and the archives they are converted through.
+*.sif
+*.simg
+*.tar
+
+# Python bytecode
+__pycache__/
+*.pyc

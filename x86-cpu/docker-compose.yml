@@ -1,0 +1,23 @@
+version: '3'
+
+#volumes:
+#    home_cactus:
+
+services:
+
+  cactus-service:
+    build:
+        context: .
+        dockerfile: Dockerfile
+    image: stevenrbrandt/cactus
+    hostname: cactus-host
+    container_name: cactus
+    ports:
+      - 8888:8888
+    volumes:
+      # HOST_PATH:CONTAINER_PATH. jovyan (uid 1168, matching this host
+      # user) has its home at /home/jovyan -- that's what needs to be
+      # bound to the local ./home directory for anything built there to
+      # persist on the host.
+      - ./home:/home/jovyan
+    entrypoint: sleep infinity
