@@ -142,6 +142,24 @@ check_bound "$sourcebasedir" "sourcebasedir"
 # The image itself needs no bind: singularity resolves that path on the host
 # before it ever enters the container.
 
+# --- srun buffering --------------------------------------------------------
+# Without -u, srun collects task output and releases it in blocks, so a
+# build that is progressing normally looks hung for minutes at a time and
+# the first sign of an error arrives long after it happened. Measured on a
+# producer emitting one line per second for three seconds:
+#     srun        all three lines at +3.2s
+#     srun -u     +0.2s, +1.2s, +2.2s
+# (stdbuf -oL inside the container adds nothing once -u is set.)
+case "$exec_prefix" in
+    *srun*)
+        case " $exec_prefix " in
+            *" -u "*|*" --unbuffered "*) ;;
+            *)  exec_prefix=$(printf '%s' "$exec_prefix" | sed 's/srun/srun -u/')
+                echo "==> added -u to the exec prefix; without it srun buffers the"
+                echo "    build output and make appears to hang" ;;
+        esac ;;
+esac
+
 # --- locate the mdb tree ----------------------------------------------------
 if [ -z "$outdir" ]; then
     for c in ./simfactory/mdb ./Cactus/simfactory/mdb ../simfactory/mdb; do
