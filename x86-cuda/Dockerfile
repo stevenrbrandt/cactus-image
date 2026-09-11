@@ -464,10 +464,17 @@ RUN set -ex; \
 # docstring in each for the intended salloc -> singularity shell -> mpirun.py
 # flow. The assertions below cover the cases the originals got wrong
 # (compound nodelists, -N/-n rank counts) plus one real 2-rank launch.
-COPY bin/unslurm.py bin/singssh bin/mpirun.py bin/mpi-matrix.sh /usr/local/bin/
+COPY bin/unslurm.py bin/singssh bin/mpirun.py bin/mpi-matrix.sh bin/sim-config.sh /usr/local/bin/
 RUN set -ex; \
     chmod +x /usr/local/bin/unslurm.py /usr/local/bin/singssh \
-             /usr/local/bin/mpirun.py /usr/local/bin/mpi-matrix.sh; \
+             /usr/local/bin/mpirun.py /usr/local/bin/mpi-matrix.sh \
+             /usr/local/bin/sim-config.sh; \
+    # sim-config.sh ships here but runs outside the container, like
+    # mpi-matrix.sh: --emit must hand back its own source byte for byte, or
+    # the documented way of getting it out of a deployed image is broken.
+    sim-config.sh --emit | cmp -s - /usr/local/bin/sim-config.sh; \
+    sim-config.sh --help | grep -q 'machine'; \
+    ! sim-config.sh --machine m --image /i.simg --mpi pmi2 >/dev/null 2>&1; \
     # singssh now insists the image be a real file on a shared path, so the
     # assertions below need one that actually exists. /tmp is deliberately
     # not usable for this -- singssh rejects node-local paths.
