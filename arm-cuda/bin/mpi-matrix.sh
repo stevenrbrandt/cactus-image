@@ -50,29 +50,10 @@ MSG
     exit 2
 fi
 
-# Extra flags for srun itself -- account, partition, qos. Needed when this
-# is run from a login node rather than inside an allocation, because then
-# every combination has to allocate its own job.
-SRUN_FLAGS="${MPI_MATRIX_SRUN_FLAGS:-}"
-pos=()
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --srun-flags) SRUN_FLAGS="$2"; shift 2 ;;
-        *)            pos+=("$1"); shift ;;
-    esac
-done
-set -- ${pos+"${pos[@]}"}
-
-sif="${1:?usage: mpi-matrix.sh <image.sif> [singularity-exec-args] [--srun-flags '...']}"
+sif="${1:?usage: mpi-matrix.sh <image.sif> [singularity-exec-args] }"
 bind="${2:---bind /work}"
 T="${MPI_MATRIX_TIMEOUT:-60}"
 NODES="${MPI_MATRIX_NODES:-2}"
-
-# Lines Slurm writes to stderr that are notices, not failures. "Using
-# default partition" in particular is printed with an "srun: error:" prefix
-# on some sites, so a naive search for /error/i reports it as the reason a
-# combination failed and hides the real one.
-BENIGN='Using default partition|queued and waiting|has been allocated resources|Job [0-9]+ scheduled|Requested nodes are busy'
 
 # What does this site offer? Parse `srun --mpi=list` rather than guessing:
 # the set differs between sites and Slurm versions.
@@ -83,14 +64,6 @@ versioned=$(printf '%s\n' "$list" \
     | sed -n 's/.*versions available:[[:space:]]*//p' | tr ',' '\n' | tr -d ' ')
 plugins=$(printf '%s\n%s\n' "$plugins" "$versioned" | sed '/^$/d' | sort -u)
 
-if [ -z "${SLURM_JOB_ID:-}" ]; then
-    echo "note: not inside an allocation, so each combination allocates its own"
-    echo "      job. If this site needs an account or a non-default partition,"
-    echo "      give them here, e.g."
-    echo "        --srun-flags '-A <account> -p <partition>'"
-    echo "      or run this inside salloc -N 2 -n 2."
-    echo
-fi
 echo "site offers: $(echo $plugins | tr '\n' ' ')"
 echo "image:       $sif"
 echo "timeout:     ${T}s per combination, -N $NODES -n 2"
@@ -108,29 +81,18 @@ classify() {
     if printf '%s' "$out" | grep -q 'requires exactly 2 MPI ranks, got 1'; then
         echo "SPLIT|tasks ran as independent 1-rank jobs"; return
     fi
-    # The job never started: nothing about MPI was tested, and the fix is
-    # a scheduler one (account, partition, qos), not an MPI one. Keep it a
-    # separate verdict so it cannot be misread as "this plugin does not work".
-    local alloc
-    alloc=$(printf '%s' "$out" | grep -vE "$BENIGN" \
-            | grep -iE 'Unable to allocate resources|Invalid account|Invalid partition|account/partition|Invalid qos|Access/permission denied|specified partition|node configuration is not available|violates' \
-            | head -1)
-    if [ -n "$alloc" ]; then echo "NOJOB|${alloc#srun: error: }"; return; fi
-
     local first
-    first=$(printf '%s' "$out" | grep -viE '^[[:space:]]*$' | grep -vE "$BENIGN" \
-            | grep -iE 'error|fatal|invalid|unable|not found|refused' | head -1)
-    echo "ERROR|${first:-$(printf '%s' "$out" | grep -vE "$BENIGN" | grep -viE '^[[:space:]]*$' | head -1)}"
+    first=$(printf '%s' "$out" | grep -viE '^\s*$' | grep -iE 'error|fatal|invalid|unable|not found|refused' | head -1)
+    echo "ERROR|${first:-$(printf '%s' "$out" | head -1)}"
 }
 
 for plugin in $plugins; do
     for flavor in mpich openmpi; do
-        out=$(timeout "$T" srun $SRUN_FLAGS --mpi="$plugin" -N "$NODES" -n 2 \
+        out=$(timeout "$T" srun --mpi="$plugin" -N "$NODES" -n 2 \
                   singularity exec $bind "$sif" \
                   "/opt/cactus-deps/bin/pmi-test-$flavor" 2>&1)
         rc=$?
         res=$(classify "$rc" "$out")
-        last_out="$out"; last_combo="--mpi=$plugin + $flavor"
         printf '%-14s %-10s %-7s %s\n' "$plugin" "$flavor" "${res%%|*}" "${res#*|}"
         if [ "${res%%|*}" = PASS ]; then
             any_pass=1
@@ -144,17 +106,13 @@ if [ "$any_pass" = 1 ]; then
     echo "working combination for 'srun ... singularity exec ... cactus_sim': $best"
 else
     echo "NO combination bootstrapped a 2-rank job."
-    echo
-    echo "Full output of the last one tried ($last_combo), so the reason is"
-    echo "visible rather than reduced to one line:"
-    printf '%s\n' "${last_out:-(no output)}" | tail -25 | sed 's/^/    /'
 fi
 
 # The env-stripping failure, demonstrated rather than asserted: srun passes
 # the PMI handshake entirely through environment variables.
 if [ -n "$best" ]; then
     p="${best#--mpi=}"; p="${p%% *}"; f="${best##*+ }"
-    out=$(timeout "$T" srun $SRUN_FLAGS --mpi="$p" -N "$NODES" -n 2 \
+    out=$(timeout "$T" srun --mpi="$p" -N "$NODES" -n 2 \
               singularity exec --cleanenv $bind "$sif" \
               "/opt/cactus-deps/bin/pmi-test-$f" 2>&1); rc=$?
     res=$(classify "$rc" "$out")

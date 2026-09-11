@@ -4,7 +4,7 @@
 Intended flow:
 
     # 1. get an interactive allocation on the cluster
-    salloc -N 2 -n 8 -p <partition> -A <account>
+    salloc -N 2 -n 8 -p gpu2 -A $ACCOUNT
     # 2. enter the image once
     singularity shell --nv --bind /work --bind /project /work/.../cactus-cuda.simg
     # 3. inside it, launch across the whole allocation

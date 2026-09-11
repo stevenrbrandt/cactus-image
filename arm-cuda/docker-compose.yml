@@ -1,0 +1,38 @@
+version: '3.8'
+
+#volumes:
+#    home_cactus_arm_cuda:
+
+services:
+
+  cactus-arm-cuda-service:
+    # Grace Hopper is aarch64; on an x86 host this builds under emulation.
+    platform: linux/arm64
+    build:
+        context: .
+        dockerfile: Dockerfile
+    image: stevenrbrandt/cactus-arm-cuda
+    hostname: cactus-arm-cuda-host
+    container_name: cactus-arm-cuda
+    ports:
+      - 8888:8888
+    volumes:
+      # HOST_PATH:CONTAINER_PATH. jovyan (uid 1168, matching this host
+      # user) has its home at /home/jovyan -- that's what needs to be
+      # bound to the local ./home directory for anything built there to
+      # persist on the host.
+      - ./home:/home/jovyan
+    # Passes the host's GPU(s) through to the container (needs the NVIDIA
+    # Container Toolkit/CDI configured on the Docker host -- this is a
+    # host-level prerequisite, separate from anything in this image).
+    # AMReX itself isn't prebuilt (see Dockerfile/cactus-cuda-*.cfg) --
+    # this is what makes the actual GPU visible for its singularity-time
+    # build and for running the resulting executable.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: sleep infinity
