@@ -20,15 +20,22 @@ the other.
 
 ## Images
 
-| directory  | base                     | state       |
-|------------|--------------------------|-------------|
-| `x86-cpu`  | Debian trixie            | built       |
-| `x86-cuda` | Debian bookworm, CUDA 12.9 | built     |
-| ARM + CUDA (Grace Hopper) | —         | planned, see `images.md` |
-| x86 + HIP  | —                        | planned, see `images.md` |
+| directory  | base / toolkit                  | GPU arch      | state |
+|------------|---------------------------------|---------------|-------|
+| `x86-cpu`  | Debian trixie                   | —             | built |
+| `x86-cuda` | Debian bookworm, CUDA 12.9      | sm_70, sm_80  | built |
+| `arm-cuda` | Debian bookworm, CUDA 13.4, sbsa | sm_90        | written; build not yet verified |
+| x86 + HIP  | —                               | —             | planned, see `images.md` |
 
-`x86-cuda` pins CUDA 12.9 because sm_70 support is required, and prebuilds
-AMReX for `sm_70` and `sm_80`.
+`x86-cuda` pins CUDA 12.9 because sm_70 (Volta) support is required, and
+prebuilds AMReX for `sm_70` and `sm_80`.
+
+`arm-cuda` targets Grace Hopper (aarch64, sm_90) and is on CUDA 13 because
+it has to be: NVIDIA's `debian12/sbsa` repo publishes only CUDA 13.x, with
+no 12.x at all. That costs nothing here, since sm_70 was the only reason
+for the 12.9 pin — but it does mean `arm-cuda` cannot target Volta, and the
+build asserts that `sm_70` is rejected so the image cannot silently drift
+from what its optionlists claim.
 
 Each image directory holds a `Dockerfile`, a `docker-compose.yml`, one
 optionlist per MPI flavor, and the check scripts the build runs against
