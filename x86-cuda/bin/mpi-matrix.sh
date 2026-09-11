@@ -55,6 +55,7 @@ fi
 # every combination has to allocate its own job.
 SRUN_FLAGS="${MPI_MATRIX_SRUN_FLAGS:-}"
 NODES_ARG=""; T_ARG=""
+PMI_TEST_DIR="${MPI_MATRIX_PMI_TEST_DIR:-}"
 usage() {
     cat <<'USAGE'
 usage: mpi-matrix.sh <image.sif> [singularity-exec-args] [options]
@@ -68,6 +69,9 @@ options:
       --srun-flags "..." any other srun flags (qos, reservation, gres, ...)
       --nodes N          nodes per combination (default 2)
       --timeout SECS     per-combination timeout (default 60)
+      --pmi-test-dir D   where pmi-test-<flavor> lives in the image
+                         (default: probed -- /usr/local/bin, then
+                         /opt/mpi/bin, then /opt/cactus-deps/bin)
       --emit             print this script's own source and exit
   -h, --help             this message
 
@@ -92,6 +96,7 @@ while [ $# -gt 0 ]; do
         --srun-flags)   SRUN_FLAGS="$SRUN_FLAGS $2"; shift 2 ;;
         --nodes)        NODES_ARG="$2"; shift 2 ;;
         --timeout)      T_ARG="$2"; shift 2 ;;
+        --pmi-test-dir) PMI_TEST_DIR="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         -*)
             # The second positional is the singularity exec args, and those
@@ -137,6 +142,24 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "      or run this inside salloc -N 2 -n 2."
     echo
 fi
+# Where the two-rank test binaries live inside the image. mpi-base puts
+# them on PATH in /usr/local/bin; the Cactus images built before that
+# used /opt/cactus-deps/bin. Probe once with a plain `singularity exec` -- no
+# scheduler involved, so this works on a login node -- rather than making
+# the caller know, or guessing and reporting a dozen "not found" rows.
+if [ -z "$PMI_TEST_DIR" ]; then
+    PMI_TEST_DIR=$(singularity exec $bind "$sif" sh -c '
+        for d in /usr/local/bin /opt/mpi/bin /opt/cactus-deps/bin; do
+            [ -x "$d/pmi-test-mpich" ] && { printf %s "$d"; break; }
+        done' 2>/dev/null)
+fi
+if [ -z "$PMI_TEST_DIR" ]; then
+    echo "mpi-matrix.sh: no pmi-test-mpich found in $sif (looked in" >&2
+    echo "               /usr/local/bin, /opt/mpi/bin, /opt/cactus-deps/bin)." >&2
+    echo "               directory with --pmi-test-dir." >&2
+    exit 2
+fi
+
 echo "site offers: $(echo $plugins | tr '\n' ' ')"
 echo "image:       $sif"
 echo "timeout:     ${T}s per combination, -N $NODES -n 2"
@@ -173,7 +196,7 @@ for plugin in $plugins; do
     for flavor in mpich openmpi; do
         out=$(timeout "$T" srun $SRUN_FLAGS --mpi="$plugin" -N "$NODES" -n 2 \
                   singularity exec $bind "$sif" \
-                  "/opt/cactus-deps/bin/pmi-test-$flavor" 2>&1)
+                  "$PMI_TEST_DIR/pmi-test-$flavor" 2>&1)
         rc=$?
         res=$(classify "$rc" "$out")
         last_out="$out"; last_combo="--mpi=$plugin + $flavor"
@@ -187,7 +210,7 @@ done
 
 echo
 if [ "$any_pass" = 1 ]; then
-    echo "working combination for 'srun ... singularity exec ... cactus_sim': $best"
+    echo "working combination for 'srun ... singularity exec ... <program>': $best"
 else
     echo "NO combination bootstrapped a 2-rank job."
     echo
@@ -202,7 +225,7 @@ if [ -n "$best" ]; then
     p="${best#--mpi=}"; p="${p%% *}"; f="${best##*+ }"
     out=$(timeout "$T" srun $SRUN_FLAGS --mpi="$p" -N "$NODES" -n 2 \
               singularity exec --cleanenv $bind "$sif" \
-              "/opt/cactus-deps/bin/pmi-test-$f" 2>&1); rc=$?
+              "$PMI_TEST_DIR/pmi-test-$f" 2>&1); rc=$?
     res=$(classify "$rc" "$out")
     echo "same combination with --cleanenv: ${res%%|*} ${res#*|}"
 fi

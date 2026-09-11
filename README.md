@@ -18,6 +18,13 @@ prebuilt AMReX / ADIOS2 / openPMD. Which one works is a property of the
 site: a cluster's `srun --mpi=` plugins may bootstrap one and silently fail
 the other.
 
+## mpi-base
+
+`mpi-base/` is the MPI half of this on its own: two complete MPI stacks, the
+two-rank test, `mpi-matrix.sh` and the `mpirun.py`/`singssh` launcher, with
+no Cactus, CUDA or I/O libraries. 669 MB against the Cactus images' 13 GB,
+and other projects can build on it directly. See `mpi-base/README.md`.
+
 ## Images
 
 | directory  | base / toolkit                  | GPU arch      | state |
