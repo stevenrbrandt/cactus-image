@@ -66,9 +66,9 @@ salloc -N 2 -n 2 && ./mpi-matrix.sh /path/to/cactus-cuda.simg
 
 ## Quick start
 
-`QUICKSTART.md` walks through building and running Cactus with these images
-without SimFactory: `make` inside the container, then `srun`, `mpirun` or
-`mpirun.py` depending on the machine.
+`QUICKSTART.md` walks through building Cactus with `make` inside the
+container and running it with `mpirun`, `srun` or `mpirun.py`, depending on
+the machine.
 
 ## Two ways to launch, and why there are two
 
