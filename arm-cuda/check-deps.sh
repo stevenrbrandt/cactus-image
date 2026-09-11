@@ -65,13 +65,29 @@ check_lib() {
 
 echo "== apt-provided ExternalLibraries =="
 
-# Boost: the full list its find_lib demands. boost/system.hpp is the one
-# that catches out distros shipping Boost < 1.79.
-check_lib Boost /usr \
+# Boost is NOT checked against /usr on this architecture, and is not taken
+# from there either -- see BOOST_DIR in the optionlists.
+#
+# Cactus's ExternalLibraries/Boost find_lib demands all eight of
+#   boost_atomic boost_filesystem
+#   boost_math_c99 boost_math_c99f boost_math_c99l
+#   boost_math_tr1 boost_math_tr1f boost_math_tr1l
+# and Debian arm64 ships only six: the two long-double variants
+# (libboost_math_c99l, libboost_math_tr1l) do not exist in the arm64
+# packages, though they do on amd64. Verified by installing
+# libboost1.81-all-dev on both and listing /usr/lib/*/libboost_math*.
+#
+# find_lib is all-or-nothing, so system Boost can never be detected here no
+# matter what BOOST_DIR says. The optionlists therefore ask Cactus to build
+# its own bundled Boost instead, and checking /usr for libraries it will
+# not use would only fail the image build for no reason.
+#
+# The headers are still worth checking: they catch a Boost too old for the
+# ET_2026_05 thorn (boost/system.hpp arrived in 1.79), which would be a
+# real problem for anything else that uses them.
+check_lib Boost-headers /usr \
     boost/atomic.hpp boost/filesystem.hpp boost/math/constants/constants.hpp \
-    boost/math/tr1.hpp boost/system.hpp \
-    -- boost_atomic boost_filesystem boost_math_c99 boost_math_c99f \
-       boost_math_c99l boost_math_tr1 boost_math_tr1f boost_math_tr1l
+    boost/math/tr1.hpp boost/system.hpp --
 
 check_lib GSL      /usr gsl/gsl_version.h -- gsl
 check_lib zlib     /usr zlib.h            -- z
