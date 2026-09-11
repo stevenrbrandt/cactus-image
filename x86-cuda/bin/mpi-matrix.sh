@@ -54,19 +54,65 @@ fi
 # is run from a login node rather than inside an allocation, because then
 # every combination has to allocate its own job.
 SRUN_FLAGS="${MPI_MATRIX_SRUN_FLAGS:-}"
-pos=()
+NODES_ARG=""; T_ARG=""
+usage() {
+    cat <<'USAGE'
+usage: mpi-matrix.sh <image.sif> [singularity-exec-args] [options]
+
+  <image.sif>              the image to test
+  [singularity-exec-args]  e.g. "--nv --bind /work --bind /project"
+
+options:
+  -p, --partition NAME   partition/queue to run in
+  -A, --account NAME     account to charge
+      --srun-flags "..." any other srun flags (qos, reservation, gres, ...)
+      --nodes N          nodes per combination (default 2)
+      --timeout SECS     per-combination timeout (default 60)
+      --emit             print this script's own source and exit
+  -h, --help             this message
+
+Partition and account have no defaults. Running outside an allocation
+means every combination allocates its own job, so a site that requires
+either will reject all of them -- which shows up as NOJOB rows naming the
+scheduler's reason.
+
+  salloc -N 2 -n 2 -A myacct -p mypart
+  ./mpi-matrix.sh /path/image.sif "--nv --bind /work"
+
+  # or, from a login node:
+  ./mpi-matrix.sh /path/image.sif "--nv --bind /work" -A myacct -p mypart
+USAGE
+}
+
+pos=(); npos=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --srun-flags) SRUN_FLAGS="$2"; shift 2 ;;
-        *)            pos+=("$1"); shift ;;
+        -p|--partition) SRUN_FLAGS="$SRUN_FLAGS -p $2"; shift 2 ;;
+        -A|--account)   SRUN_FLAGS="$SRUN_FLAGS -A $2"; shift 2 ;;
+        --srun-flags)   SRUN_FLAGS="$SRUN_FLAGS $2"; shift 2 ;;
+        --nodes)        NODES_ARG="$2"; shift 2 ;;
+        --timeout)      T_ARG="$2"; shift 2 ;;
+        -h|--help)      usage; exit 0 ;;
+        -*)
+            # The second positional is the singularity exec args, and those
+            # legitimately start with a dash ("--nv --bind /work"). So a
+            # dashed argument is only an unknown option once both
+            # positionals are already in hand; before that it is data.
+            if [ "$npos" -lt 2 ]; then
+                pos+=("$1"); npos=$((npos+1)); shift
+            else
+                echo "mpi-matrix.sh: unknown option $1" >&2; usage >&2; exit 2
+            fi ;;
+        *)              pos+=("$1"); npos=$((npos+1)); shift ;;
     esac
 done
 set -- ${pos+"${pos[@]}"}
 
-sif="${1:?usage: mpi-matrix.sh <image.sif> [singularity-exec-args] [--srun-flags '...']}"
+if [ $# -lt 1 ]; then usage >&2; exit 2; fi
+sif="$1"
 bind="${2:---bind /work}"
-T="${MPI_MATRIX_TIMEOUT:-60}"
-NODES="${MPI_MATRIX_NODES:-2}"
+T="${T_ARG:-${MPI_MATRIX_TIMEOUT:-60}}"
+NODES="${NODES_ARG:-${MPI_MATRIX_NODES:-2}}"
 
 # Lines Slurm writes to stderr that are notices, not failures. "Using
 # default partition" in particular is printed with an "srun: error:" prefix
