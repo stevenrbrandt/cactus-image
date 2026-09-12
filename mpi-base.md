@@ -112,7 +112,13 @@ the site can bootstrap.
 
 ## Launching
 
-**Over the site's PMI**, from outside the image:
+There are two routes, and they fail in different ways. Use the first where
+the site supports it; use the second where it does not.
+
+### srun, over the site's PMI
+
+From **outside** the image — `srun` starts the ranks and each enters the
+container:
 
 ```bash
 srun --mpi=pmi2 -N 2 -n 8 singularity exec --bind /work image.sif ./myprog
@@ -121,9 +127,30 @@ srun --mpi=pmi2 -N 2 -n 8 singularity exec --bind /work image.sif ./myprog
 Never add `--cleanenv`: Slurm passes the PMI handshake purely through
 environment variables, and stripping them produces `SPLIT`.
 
-**Over ssh**, when no plugin works — `mpirun.py` re-enters the image on each
-node and does not use the site's PMI at all. It runs from inside the image,
-within an allocation:
+### mpirun.py: launching over ssh instead
+
+`mpirun.py` is the answer to a site whose PMI cannot start your MPI. It
+bootstraps the job over ssh through MPICH's Hydra, re-entering the image on
+each node, so **it does not use the site's PMI at all** — none of the
+`--mpi=` question applies to it.
+
+Reach for it when:
+
+- `mpi-matrix.sh` shows no `PASS` row for the flavor you built against.
+  This is not hypothetical: on one cluster only OpenMPI with `pmix_v4`
+  works, and `pmix_v5` hangs outright.
+- Ranks come up as `SPLIT` — each believing it is rank 0 of 1 — and you
+  need something that either works or fails loudly.
+- You want one launch command that behaves the same across machines,
+  rather than a per-site `--mpi=` value to discover and maintain.
+
+It is *not* a general `mpirun` replacement: it exists to launch **container**
+ranks. It refuses to run without an image to enter (see below), and only
+drives MPICH.
+
+#### Running it
+
+From inside the image, within an allocation:
 
 ```bash
 salloc -N 2 -n 8 -A <account> -p <partition>
@@ -132,13 +159,66 @@ export MPI_FLAVOR=mpich                 # must match what you built against
 export SINGSSH_IMAGE=/path/image.sif    # a path visible on every node
 export SINGSSH_EXEC_ARGS="--bind /work" # the remote exec inherits none of yours
 
-singularity exec --bind /work image.sif mpirun.py -n 8 ./myprog
+singularity exec --bind /work image.sif mpirun.py ./myprog
 ```
 
-`mpirun.py` currently drives MPICH's Hydra. With OpenMPI it stops with an
-explanation rather than launching, because OpenMPI would ignore the launcher
-and start ranks *outside* the container — a silent failure rather than a
-loud one.
+No rank count is needed: it takes the shape of the job from the allocation.
+`MPIRUN_DRY_RUN=1` prints the command instead of running it, which is the
+quickest way to see what it decided:
+
+```
+$ SLURM_NPROCS=8 SLURM_NTASKS_PER_NODE=4 SLURM_NODELIST=n[001-002] \
+  MPIRUN_DRY_RUN=1 mpirun.py ./myprog
+/opt/mpi/mpich/bin/mpirun -launcher ssh -launcher-exec /usr/local/bin/singssh \
+    -np 8 -ppn 4 -hosts n001,n002 ./myprog
+```
+
+- `-np` comes from `$SLURM_NPROCS`, `-ppn` from `$SLURM_NTASKS_PER_NODE`,
+  and `-hosts` from `$SLURM_NODELIST` expanded through `unslurm.py`, so
+  compound lists like `n[001-003],ngpu05` are handled.
+- Anything you pass yourself wins: `mpirun.py -n 3 ./myprog` emits no `-np`
+  of its own. Other Hydra flags pass straight through.
+- Outside an allocation it degrades to `-np 1` with no `-hosts`, i.e. a
+  local single-rank run.
+
+It then strips `SLURM_*` and `MODULE*` from the environment the job
+inherits. That is deliberate: left in place, Hydra half-detects Slurm and
+tries to use its PMI, which is the thing being avoided.
+
+#### What it needs
+
+- **An image to enter.** `SINGSSH_IMAGE`, or being inside a container whose
+  runtime reports a usable path. Without one it stops before launching:
+
+  ```
+  singssh: cannot determine which image the remote ranks should enter
+  ```
+
+  `SINGSSH_IMAGE` is *required* wherever the runtime prints
+  `INFO: Mounting image with FUSE` — `SINGULARITY_CONTAINER` then names a
+  node-local extracted rootfs that no other node can open.
+
+- **`SINGSSH_EXEC_ARGS`.** The remote `singularity exec` inherits none of
+  your flags, so without it the ranks start with `/work` unbound and cannot
+  find the executable. Binds are derived from `SINGULARITY_BIND` when it is
+  unset, but `--nv` cannot be inferred reliably.
+
+- **Passwordless ssh between the allocated nodes**, and an ssh client in the
+  image — `mpi-base` installs one.
+
+#### MPICH only, by refusal
+
+With `MPI_FLAVOR=openmpi` it stops rather than launching:
+
+```
+mpirun.py: resolved MPI is '/opt/mpi/openmpi/bin/mpirun' (openmpi).
+           This launcher builds MPICH/Hydra options ...
+```
+
+`-launcher`/`-launcher-exec` are Hydra-specific. OpenMPI would ignore them,
+fall back to plain ssh, and start ranks *outside* the container — which
+fails silently if the host has its own MPI. Stopping is the loud failure.
+The OpenMPI equivalent would be `--mca plm_rsh_agent`; it is not wired up.
 
 ## Environment reference
 
@@ -170,8 +250,8 @@ launch.
 
 ## Limits
 
-- `mpirun.py`'s ssh route is MPICH-only.
-- The ssh route assumes passwordless ssh between allocated nodes.
-- Tested on Debian-family bases; the prefix builder reads `mpicc.<flavor>
-  -show` rather than assuming paths, but it has only been run against
-  Debian's packaging.
+- `mpirun.py` drives MPICH only, and launches container ranks only — see
+  above.
+- Tested on Debian-family bases. The prefix builder reads `mpicc.<flavor>
+  -show` rather than assuming paths, so it is not tied to one release's
+  layout, but it has only been run against Debian's packaging.
