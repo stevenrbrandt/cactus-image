@@ -25,7 +25,8 @@
 # CUDA 12.9 is also the last release supporting the full Volta-through-
 # Hopper range in one toolkit, so this image covers V100 through H100, not
 # just old hardware.
-FROM python:3.14-slim-bookworm
+ARG MPI_BASE=stevenrbrandt/mpi-base:bookworm
+FROM ${MPI_BASE}
 
 ARG JUPYTERHUB_VERSION=5.5.1
 
@@ -60,8 +61,8 @@ ENV GIT_AUTHOR_NAME="Cactus Builder" \
 # default is already 1.83, which is why x86-cpu doesn't need this.
 RUN apt update -y && apt install -y curl \
     cmake ninja-build gfortran gcc g++ libpapi-dev libgsl-dev liblapack-dev libblas-dev \
-    libhdf5-dev libopenmpi-dev openmpi-bin libhdf5-openmpi-dev \
-    mpich libmpich-dev libhdf5-mpich-dev \
+    libhdf5-dev libhdf5-openmpi-dev \
+    libhdf5-mpich-dev \
     libpmi2-0-dev libpmix-dev libpmix-bin \
     pkg-config subversion git python3 patch make numactl libhwloc-dev \
     hwloc libssl-dev libfftw3-dev rsync libboost1.81-all-dev vim \
@@ -142,10 +143,9 @@ ARG OPENPMD_VERSION=0.17.1
 # thorns that consume it are compiled equally quietly.
 ARG AMREX_CUDA_ARCHS="70;80"
 
-COPY pmi-test.c /tmp/pmi-test.c
 
 # build_stack <flavor> <mpicc> <mpicxx> <h5pcc>
-# One MPI-flavor's worth of AMReX + ADIOS2 + openPMD-api + pmi-test,
+# One MPI-flavor's worth of AMReX + ADIOS2 + openPMD-api,
 # installed under $CACTUS_DEPS_PREFIX/<name>-<flavor>. Called once per
 # flavor below.
 #
@@ -210,113 +210,23 @@ RUN set -ex; \
         cmake --install "$build/openpmd/build"; \
         \
         mkdir -p "$CACTUS_DEPS_PREFIX/bin"; \
-        "$mpicc" -O2 -o "$CACTUS_DEPS_PREFIX/bin/pmi-test-$flavor" /tmp/pmi-test.c; \
         \
         rm -rf "$build"; \
     }; \
     mkdir -p "$CACTUS_DEPS_PREFIX"; \
     build_stack openmpi /usr/bin/mpicc.openmpi /usr/bin/mpicxx.openmpi /usr/bin/h5pcc.openmpi; \
-    build_stack mpich   /usr/bin/mpicc.mpich   /usr/bin/mpicxx.mpich   /usr/bin/h5pcc.mpich; \
-    rm -f /tmp/pmi-test.c
+    build_stack mpich   /usr/bin/mpicc.mpich   /usr/bin/mpicxx.mpich   /usr/bin/h5pcc.mpich;
 
 # ---------------------------------------------------------------------------
-# Per-flavor MPI prefixes: /opt/mpi/openmpi and /opt/mpi/mpich.
+# The two MPI stacks, their /opt/mpi/<flavor> prefixes, the two-rank
+# pmi-test binaries and the mpirun.py/singssh/mpi-matrix.sh launcher
+# machinery all come from mpi-base (see ../mpi-base). None of it was ever
+# Cactus-specific, and keeping one copy is what stops the images drifting
+# apart -- which they did, silently, when this was duplicated per image.
 #
-# Debian installs both MPIs into one shared namespace: headers and libs are
-# already separated (/usr/lib/x86_64-linux-gnu/{openmpi,mpich}/), but the
-# binaries all land in /usr/bin with `.openmpi`/`.mpich` suffixes, and the
-# unsuffixed names (mpicc, mpicxx, mpirun, mpiexec) are a single
-# update-alternatives symlink that can only point at ONE implementation --
-# OpenMPI, by default. That makes `MPI_DIR = /usr` ambiguous: it silently
-# means "OpenMPI" to anything resolving the generic names, and
-# `find /usr -name mpirun` turns up only the one alternatives symlink.
-#
-# That isn't just cosmetic. CMake's FindMPI, given no hints, resolves
-# /usr/bin/mpicc -> alternatives -> OpenMPI unconditionally (verified).
-# AMReX's bundled build.sh (which is what builds AMReX at singularity time
-# in this image, since AMReX is deliberately not prebuilt) passes CMake no
-# MPI hints at all -- only -I${MPI_INC_DIRS} into CXXFLAGS. So a MPICH
-# configuration would have gotten MPICH *headers* with OpenMPI *libraries*:
-# exactly the ABI mismatch this project takes pains to avoid everywhere
-# else.
-#
-# These prefixes give each implementation a real, self-consistent root with
-# a working bin/, include/ and lib/, so MPI_DIR/MPI_HOME in the optionlists
-# name exactly one implementation and nothing has to guess. The underlying
-# binaries are still Debian's -- deliberately, since those are built
-# --with-pmix/--with-slurm (OpenMPI) and --with-slurm (MPICH, hydra linked
-# against libslurm), which is the whole reason this image uses distro MPI
-# packages rather than compiling its own.
-#
-#
-# Two details this has to get right, both found by actually running a
-# 2-rank job through each prefix rather than assuming symlinks suffice:
-#   - The lib/include locations are derived from each wrapper's own `-show`
-#     output rather than hardcoded, because the distros disagree: on trixie
-#     MPICH keeps libs in .../mpich/lib, on bookworm they sit flat in
-#     /usr/lib/<triplet> with no mpich/lib at all. Deriving them means the
-#     optionlists can name /opt/mpi/<flavor>/{include,lib} uniformly and be
-#     correct on both. (When the lib dir is shared rather than
-#     flavor-specific, only that flavor's own libmpi* are linked in, so the
-#     prefix never exposes the other implementation's libraries.)
-#   - MPICH's hydra locates hydra_pmi_proxy relative to its own argv[0], so
-#     a bare mpirun symlink launches rank 0 and then dies with "execvp
-#     error on file .../hydra_pmi_proxy". The hydra_* helpers have to be
-#     linked in alongside it. OpenMPI has no such issue (compiled-in
-#     prefix).
-#   - The two implementations don't ship the same set of wrapper *names*:
-#     Debian's OpenMPI provides mpic++/mpiCC, MPICH provides only mpicxx.
-#     A prefix missing `mpic++` is not merely incomplete, it is dangerous:
-#     build systems that probe for that specific name (HPCToolkit's Meson
-#     build does) find nothing in the prefix, fall through to /usr/bin's
-#     alternatives symlink, and silently bind to OpenMPI instead. That was
-#     caught with hpctoolkit-mpich linking OpenMPI 4.1.4. So each prefix
-#     also gets aliases for the equivalent-but-differently-named wrappers.
-# The build fails here if either prefix can't actually run a 2-rank job.
-# Placed here, after the expensive build steps, purely so editing it
-# doesn't invalidate their Docker layer cache -- nothing above depends on
-# it (build_stack passes explicit /usr/bin/mpicc.<flavor> paths).
-RUN set -ex; \
-    rm -rf /opt/mpi; \
-    for flavor in openmpi mpich; do \
-        mkdir -p "/opt/mpi/$flavor/bin"; \
-        for tool in mpicc mpicxx mpic++ mpif77 mpif90 mpifort mpirun mpiexec; do \
-            if [ -e "/usr/bin/$tool.$flavor" ]; then \
-                ln -sf "/usr/bin/$tool.$flavor" "/opt/mpi/$flavor/bin/$tool"; \
-            fi; \
-        done; \
-        if [ "$flavor" = mpich ]; then \
-            for helper in /usr/bin/hydra_*; do \
-                ln -sf "$helper" "/opt/mpi/mpich/bin/$(basename "$helper")"; \
-            done; \
-        fi; \
-        for alias_pair in "mpic++:mpicxx" "mpiCC:mpicxx" "mpifc:mpifort"; do \
-            a="${alias_pair%%:*}"; real="${alias_pair##*:}"; \
-            if [ ! -e "/opt/mpi/$flavor/bin/$a" ] && [ -e "/opt/mpi/$flavor/bin/$real" ]; then \
-                ln -sf "$real" "/opt/mpi/$flavor/bin/$a"; \
-            fi; \
-        done; \
-        incdir=$(mpicc.$flavor -show | xargs -n1 | grep "^-I" | head -1 | cut -c3-); \
-        libdir=$(mpicc.$flavor -show | xargs -n1 | grep "^-L" | head -1 | cut -c3-); \
-        ln -sfn "$incdir" "/opt/mpi/$flavor/include"; \
-        case "$libdir" in \
-            */$flavor|*/$flavor/*) \
-                ln -sfn "$libdir" "/opt/mpi/$flavor/lib" ;; \
-            *)  mkdir -p "/opt/mpi/$flavor/lib"; \
-                for w in mpicc mpicxx mpif90; do \
-                    [ -e "/usr/bin/$w.$flavor" ] && $w.$flavor -show | xargs -n1 | grep "^-lmpi" | cut -c3-; \
-                done | sort -u | while read -r l; do \
-                    for so in "$libdir/lib$l".so*; do \
-                        [ -e "$so" ] && ln -sf "$so" "/opt/mpi/$flavor/lib/"; \
-                    done; \
-                done ;; \
-        esac; \
-        test -x "/opt/mpi/$flavor/bin/mpirun"; \
-        test -f "/opt/mpi/$flavor/include/mpi.h"; \
-        ls "/opt/mpi/$flavor/lib/"libmpi*.so* > /dev/null; \
-    done; \
-    /opt/mpi/mpich/bin/mpirun -np 2 "$CACTUS_DEPS_PREFIX/bin/pmi-test-mpich" | grep -q "PMI-TEST: PASS"; \
-    /opt/mpi/openmpi/bin/mpirun --allow-run-as-root -np 2 "$CACTUS_DEPS_PREFIX/bin/pmi-test-openmpi" | grep -q "PMI-TEST: PASS"
+# What remains here is the Cactus half: HDF5 per flavor, the prebuilt
+# AMReX/ADIOS2/openPMD, the optionlists, and sim-config.sh.
+
 
 # Cactus optionlists pointing at the dependencies built/installed above --
 # see the header comment in each file for the full explanation of every
@@ -458,70 +368,29 @@ RUN set -ex; \
     test "$(env -u CACTUS_IMAGE_NAME hostname)" = "cactus-cuda-$real"; \
     test "$(hostname -I)" = "$(/usr/bin/hostname -I)"
 
-# Launcher trio for running across a SLURM allocation with every rank
-# inside this image: unslurm.py expands $SLURM_NODELIST, singssh re-enters
-# the container over ssh, mpirun.py wires them into MPICH's Hydra. See the
-# docstring in each for the intended salloc -> singularity shell -> mpirun.py
-# flow. The assertions below cover the cases the originals got wrong
-# (compound nodelists, -N/-n rank counts) plus one real 2-rank launch.
-COPY bin/unslurm.py bin/singssh bin/mpirun.py bin/mpi-matrix.sh bin/sim-config.sh /usr/local/bin/
+# sim-config.sh is the one launcher-adjacent tool that IS Cactus-specific
+# (it generates SimFactory machine entries), so it lives here rather than in
+# mpi-base. The rest -- unslurm.py, singssh, mpirun.py, mpi-matrix.sh -- are
+# inherited, along with their assertions; repeating those here would only
+# create a second copy to drift.
+COPY bin/sim-config.sh /usr/local/bin/
 RUN set -ex; \
-    chmod +x /usr/local/bin/unslurm.py /usr/local/bin/singssh \
-             /usr/local/bin/mpirun.py /usr/local/bin/mpi-matrix.sh \
-             /usr/local/bin/sim-config.sh; \
-    # sim-config.sh ships here but runs outside the container, like
-    # mpi-matrix.sh: --emit must hand back its own source byte for byte, or
-    # the documented way of getting it out of a deployed image is broken.
+    chmod +x /usr/local/bin/sim-config.sh; \
+    # sim-config.sh ships here but runs outside the container: --emit must
+    # hand back its own source byte for byte, or the documented way of
+    # getting it out of a deployed image is broken.
     sim-config.sh --emit | cmp -s - /usr/local/bin/sim-config.sh; \
     sim-config.sh --help | grep -q 'machine'; \
     ! sim-config.sh --machine m --image /i.simg --mpi pmi2 >/dev/null 2>&1; \
-    # singssh now insists the image be a real file on a shared path, so the
-    # assertions below need one that actually exists. /tmp is deliberately
-    # not usable for this -- singssh rejects node-local paths.
-    touch /i.simg; \
-    # mpi-matrix.sh ships in the image but runs outside it: --emit hands
-    # back its own source, and running it inside must explain that rather
-    # than dying on a missing srun.
-    mpi-matrix.sh --emit | head -1 | grep -q '^#!/bin/bash'; \
-    mpi-matrix.sh --emit | cmp -s - /usr/local/bin/mpi-matrix.sh; \
-    ! SINGULARITY_CONTAINER=/i.sif mpi-matrix.sh /i.sif 2>&1 | grep -q 'not found'; \
-    SINGULARITY_CONTAINER=/i.sif mpi-matrix.sh /i.sif 2>&1 | grep -q 'INSIDE the container'; \
-    test "$(unslurm.py 'db[001-003],dbgpu05')" = "db001,db002,db003,dbgpu05"; \
-    test "$(unslurm.py 'db[001-002],db[005-006]')" = "db001,db002,db005,db006"; \
-    test "$(SLURM_NODELIST='db[01-02,05]' unslurm.py)" = "db01,db02,db05"; \
-    test "$(SINGULARITY_CONTAINER=/i.simg SINGSSH_DRY_RUN=1 SINGSSH_SSH_OPTS= \
-            singssh -x db1 hn)" = "ssh -x db1 singularity exec /i.simg hn"; \
-    # MPICH 4.x Hydra invokes the launcher as
-    #   singssh -x --external-launcher <host> "<hydra_pmi_proxy>" --control-port ...
-    # --external-launcher is Hydra's own marker and must be dropped: ssh has
-    # no long options, so forwarding it gives "ssh: unknown option -- -" and
-    # the remote rank never starts.
-    test "$(SINGULARITY_CONTAINER=/i.simg SINGSSH_DRY_RUN=1 SINGSSH_SSH_OPTS= \
-            singssh -x --external-launcher db1 hn)" \
-       = "ssh -x db1 singularity exec /i.simg hn"; \
-    # ssh inside the container reads the image's /etc/ssh, so it has no
-    # known_hosts; without these defaults the first connection dies with
-    # "Host key verification failed" and Hydra hangs waiting for the proxy.
-    SINGULARITY_CONTAINER=/i.simg SINGSSH_DRY_RUN=1 singssh db1 hn \
-        | grep -q 'StrictHostKeyChecking=no'; \
-    test "$(SLURM_NPROCS=8 SLURM_JOB_NUM_NODES=2 SLURM_NTASKS_PER_NODE=4 \
-            SLURM_NODELIST='db[001-002]' MPI_FLAVOR=mpich MPIRUN_DRY_RUN=1 \
-            SINGSSH_IMAGE=/i.simg mpirun.py ./exe)" \
-       = "/opt/mpi/mpich/bin/mpirun -launcher ssh -launcher-exec /usr/local/bin/singssh -np 8 -ppn 4 -hosts db001,db002 ./exe"; \
-    SLURM_NPROCS=2 MPI_FLAVOR=mpich SINGSSH_IMAGE=/i.simg \
-        mpirun.py /opt/cactus-deps/bin/pmi-test-mpich \
-        | grep -q "PMI-TEST: PASS"; \
-    ! SLURM_NPROCS=2 MPI_FLAVOR=openmpi SINGSSH_IMAGE=/i.simg mpirun.py ./exe 2>/dev/null; \
-    # A node-local FUSE rootfs (what SingularityCE reports when it prints
-    # "Mounting image with FUSE") must be refused with a diagnosis, not
-    # passed to a remote singularity exec that cannot open it.
-    SINGULARITY_CONTAINER=/tmp/rootfs-123/root singssh --print-image 2>&1 \
-        | grep -q 'not a shared image file'; \
-    ! SINGULARITY_CONTAINER=/tmp/rootfs-123/root singssh --print-image >/dev/null 2>&1; \
-    test "$(SINGSSH_IMAGE=/i.simg SINGULARITY_BIND=/work,/project \
-            SINGSSH_DRY_RUN=1 SINGSSH_SSH_OPTS= singssh db1 hn)" \
-       = "ssh db1 singularity exec --bind /work,/project /i.simg hn"; \
-    rm -f /i.simg
+    # Confirm the base really is underneath: the inherited tools are on
+    # PATH, both MPI prefixes work, and a 2-rank job runs. Cheap, and it
+    # fails loudly if MPI_BASE is ever pointed at the wrong thing.
+    for t in unslurm.py singssh mpirun.py mpi-matrix.sh pmi-test-mpich pmi-test-openmpi; do \
+        command -v "$t" >/dev/null || { echo "ERROR: $t missing -- is MPI_BASE right?" >&2; exit 1; }; \
+    done; \
+    /opt/mpi/mpich/bin/mpirun -np 2 pmi-test-mpich | grep -q "PMI-TEST: PASS"; \
+    /opt/mpi/openmpi/bin/mpirun --allow-run-as-root -np 2 pmi-test-openmpi \
+        | grep -q "PMI-TEST: PASS"
 
 RUN useradd -m -u 1168 -s /bin/bash jovyan
 

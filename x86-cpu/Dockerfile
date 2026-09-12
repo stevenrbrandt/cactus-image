@@ -14,7 +14,8 @@
 # under the host's kernel, never one of their own, and glibc's syscall
 # wrappers (rseq, clone3, etc.) fall back gracefully on kernels that predate
 # them, so a newer Debian release here doesn't raise the floor a host needs.
-FROM python:3.14-slim-trixie
+ARG MPI_BASE=stevenrbrandt/mpi-base:trixie
+FROM ${MPI_BASE}
 
 ARG JUPYTERHUB_VERSION=5.5.1
 
@@ -54,8 +55,8 @@ ENV GIT_AUTHOR_NAME="Cactus Builder" \
 # whichever MPI stack they're using.
 RUN apt update -y && apt install -y curl \
     cmake ninja-build gfortran gcc g++ libpapi-dev libgsl-dev liblapack-dev libblas-dev \
-    libhdf5-dev libopenmpi-dev openmpi-bin libhdf5-openmpi-dev \
-    mpich libmpich-dev libhdf5-mpich-dev \
+    libhdf5-dev libhdf5-openmpi-dev \
+    libhdf5-mpich-dev \
     libpmi2-0-dev libpmix-dev libpmix-bin \
     pkg-config subversion git python3 patch make numactl libhwloc-dev \
     hwloc libssl-dev libfftw3-dev rsync libboost-all-dev vim \
@@ -132,7 +133,6 @@ ARG AMREX_VERSION=25.11
 ARG ADIOS2_VERSION=v2.12.1
 ARG OPENPMD_VERSION=0.17.1
 
-COPY pmi-test.c /tmp/pmi-test.c
 
 # build_stack <flavor> <mpicc> <mpicxx> <h5pcc>
 # One MPI-flavor's worth of AMReX + ADIOS2 + openPMD-api + pmi-test,
@@ -184,117 +184,36 @@ RUN set -ex; \
         cmake --install "$build/openpmd/build"; \
         \
         mkdir -p "$CACTUS_DEPS_PREFIX/bin"; \
-        "$mpicc" -O2 -o "$CACTUS_DEPS_PREFIX/bin/pmi-test-$flavor" /tmp/pmi-test.c; \
         \
         rm -rf "$build"; \
     }; \
     mkdir -p "$CACTUS_DEPS_PREFIX"; \
     build_stack openmpi /usr/bin/mpicc.openmpi /usr/bin/mpicxx.openmpi /usr/bin/h5pcc.openmpi; \
-    build_stack mpich   /usr/bin/mpicc.mpich   /usr/bin/mpicxx.mpich   /usr/bin/h5pcc.mpich; \
-    rm -f /tmp/pmi-test.c
+    build_stack mpich   /usr/bin/mpicc.mpich   /usr/bin/mpicxx.mpich   /usr/bin/h5pcc.mpich;
 
 # ---------------------------------------------------------------------------
-# Per-flavor MPI prefixes: /opt/mpi/openmpi and /opt/mpi/mpich.
+# The two MPI stacks, their /opt/mpi/<flavor> prefixes, the two-rank
+# pmi-test binaries and the mpirun.py/singssh/mpi-matrix.sh launcher
+# machinery all come from mpi-base (see ../mpi-base). None of it was ever
+# Cactus-specific, and keeping one copy is what stops the images drifting
+# apart.
 #
-# Debian installs both MPIs into one shared namespace: headers and libs are
-# already separated (/usr/lib/x86_64-linux-gnu/{openmpi,mpich}/), but the
-# binaries all land in /usr/bin with `.openmpi`/`.mpich` suffixes, and the
-# unsuffixed names (mpicc, mpicxx, mpirun, mpiexec) are a single
-# update-alternatives symlink that can only point at ONE implementation --
-# OpenMPI, by default. That makes `MPI_DIR = /usr` ambiguous: it silently
-# means "OpenMPI" to anything resolving the generic names, and
-# `find /usr -name mpirun` turns up only the one alternatives symlink.
-#
-# That isn't just cosmetic: CMake's FindMPI, given no hints, resolves
-# /usr/bin/mpicc -> alternatives -> OpenMPI unconditionally (verified). It
-# doesn't bite this image's *prebuilt* stack -- build_stack below passes
-# -DMPI_C_COMPILER/-DMPI_CXX_COMPILER explicitly, and each resulting
-# library was confirmed (via ldd) to link its own flavor -- but anything
-# built later at singularity time from a CMake-based ExternalLibrary
-# (NSIMD is deliberately deferred; AMReX too if AMREX_DIR=BUILD) would
-# otherwise silently grab OpenMPI regardless of which optionlist is in use.
-#
-# These prefixes give each implementation a real, self-consistent root with
-# a working bin/, include/ and lib/, so MPI_DIR/MPI_HOME in the optionlists
-# name exactly one implementation and nothing has to guess. The underlying
-# binaries are still Debian's -- deliberately, since those are built
-# --with-pmix=external --with-slurm (OpenMPI) and --with-slurm (MPICH,
-# hydra linked against libslurm), which is the whole reason this image uses
-# distro MPI packages rather than compiling its own.
-#
-#
-# Two details this has to get right, both found by actually running a
-# 2-rank job through each prefix rather than assuming symlinks suffice:
-#   - The lib/include locations are derived from each wrapper's own `-show`
-#     output rather than hardcoded, because the distros disagree: on trixie
-#     MPICH keeps libs in .../mpich/lib, on bookworm they sit flat in
-#     /usr/lib/<triplet> with no mpich/lib at all. Deriving them means the
-#     optionlists can name /opt/mpi/<flavor>/{include,lib} uniformly and be
-#     correct on both. (When the lib dir is shared rather than
-#     flavor-specific, only that flavor's own libmpi* are linked in, so the
-#     prefix never exposes the other implementation's libraries.)
-#   - MPICH's hydra locates hydra_pmi_proxy relative to its own argv[0], so
-#     a bare mpirun symlink launches rank 0 and then dies with "execvp
-#     error on file .../hydra_pmi_proxy". The hydra_* helpers have to be
-#     linked in alongside it. OpenMPI has no such issue (compiled-in
-#     prefix).
-#   - The two implementations don't ship the same set of wrapper *names*:
-#     Debian's OpenMPI provides mpic++/mpiCC, MPICH provides only mpicxx.
-#     A prefix missing `mpic++` is not merely incomplete, it is dangerous:
-#     build systems that probe for that specific name (HPCToolkit's Meson
-#     build does) find nothing in the prefix, fall through to /usr/bin's
-#     alternatives symlink, and silently bind to OpenMPI instead. That was
-#     caught with hpctoolkit-mpich linking OpenMPI 4.1.4. So each prefix
-#     also gets aliases for the equivalent-but-differently-named wrappers.
-# The build fails here if either prefix can't actually run a 2-rank job.
-# Placed here, after the expensive build steps, purely so editing it
-# doesn't invalidate their Docker layer cache -- nothing above depends on
-# it (build_stack passes explicit /usr/bin/mpicc.<flavor> paths).
-RUN set -ex; \
-    rm -rf /opt/mpi; \
-    for flavor in openmpi mpich; do \
-        mkdir -p "/opt/mpi/$flavor/bin"; \
-        for tool in mpicc mpicxx mpic++ mpif77 mpif90 mpifort mpirun mpiexec; do \
-            if [ -e "/usr/bin/$tool.$flavor" ]; then \
-                ln -sf "/usr/bin/$tool.$flavor" "/opt/mpi/$flavor/bin/$tool"; \
-            fi; \
-        done; \
-        if [ "$flavor" = mpich ]; then \
-            for helper in /usr/bin/hydra_*; do \
-                ln -sf "$helper" "/opt/mpi/mpich/bin/$(basename "$helper")"; \
-            done; \
-        fi; \
-        for alias_pair in "mpic++:mpicxx" "mpiCC:mpicxx" "mpifc:mpifort"; do \
-            a="${alias_pair%%:*}"; real="${alias_pair##*:}"; \
-            if [ ! -e "/opt/mpi/$flavor/bin/$a" ] && [ -e "/opt/mpi/$flavor/bin/$real" ]; then \
-                ln -sf "$real" "/opt/mpi/$flavor/bin/$a"; \
-            fi; \
-        done; \
-        incdir=$(mpicc.$flavor -show | xargs -n1 | grep "^-I" | head -1 | cut -c3-); \
-        libdir=$(mpicc.$flavor -show | xargs -n1 | grep "^-L" | head -1 | cut -c3-); \
-        ln -sfn "$incdir" "/opt/mpi/$flavor/include"; \
-        case "$libdir" in \
-            */$flavor|*/$flavor/*) \
-                ln -sfn "$libdir" "/opt/mpi/$flavor/lib" ;; \
-            *)  mkdir -p "/opt/mpi/$flavor/lib"; \
-                for w in mpicc mpicxx mpif90; do \
-                    [ -e "/usr/bin/$w.$flavor" ] && $w.$flavor -show | xargs -n1 | grep "^-lmpi" | cut -c3-; \
-                done | sort -u | while read -r l; do \
-                    for so in "$libdir/lib$l".so*; do \
-                        [ -e "$so" ] && ln -sf "$so" "/opt/mpi/$flavor/lib/"; \
-                    done; \
-                done ;; \
-        esac; \
-        test -x "/opt/mpi/$flavor/bin/mpirun"; \
-        test -f "/opt/mpi/$flavor/include/mpi.h"; \
-        ls "/opt/mpi/$flavor/lib/"libmpi*.so* > /dev/null; \
-    done; \
-    /opt/mpi/mpich/bin/mpirun -np 2 "$CACTUS_DEPS_PREFIX/bin/pmi-test-mpich" | grep -q "PMI-TEST: PASS"; \
-    /opt/mpi/openmpi/bin/mpirun --allow-run-as-root -np 2 "$CACTUS_DEPS_PREFIX/bin/pmi-test-openmpi" | grep -q "PMI-TEST: PASS"
+# Note this image previously shipped none of the launcher tools at all --
+# they were added to the CUDA images only. Rebasing gives x86-cpu
+# mpirun.py, singssh and mpi-matrix.sh for the first time.
+
 
 # Cactus optionlists pointing at the dependencies built/installed above --
 # see the header comment in each file for the full explanation of every
 # setting, and which one to pick for a given HPC site's PMI support.
+RUN set -ex; \
+    for tool in unslurm.py singssh mpirun.py mpi-matrix.sh pmi-test-mpich pmi-test-openmpi; do \
+        command -v "$tool" >/dev/null || { echo "ERROR: $tool missing -- is MPI_BASE right?" >&2; exit 1; }; \
+    done; \
+    /opt/mpi/mpich/bin/mpirun -np 2 pmi-test-mpich | grep -q "PMI-TEST: PASS"; \
+    /opt/mpi/openmpi/bin/mpirun --allow-run-as-root -np 2 pmi-test-openmpi \
+        | grep -q "PMI-TEST: PASS"
+
 COPY cactus-openmpi.cfg /opt/cactus-deps/cactus-openmpi.cfg
 COPY cactus-mpich.cfg /opt/cactus-deps/cactus-mpich.cfg
 

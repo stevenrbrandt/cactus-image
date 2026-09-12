@@ -23,7 +23,7 @@ the other.
 `mpi-base/` is the MPI half of this on its own: two complete MPI stacks, the
 two-rank test, `mpi-matrix.sh` and the `mpirun.py`/`singssh` launcher, with
 no Cactus, CUDA or I/O libraries. 669 MB against the Cactus images' 13 GB,
-and other projects can build on it directly. See `mpi-base/README.md`.
+and other projects can build on it directly. See [mpi-base.md](mpi-base.md).
 
 ## Images
 
