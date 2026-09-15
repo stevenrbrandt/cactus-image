@@ -13,8 +13,8 @@
 #     multiarch triplet is aarch64-linux-gnu.
 #
 #   - CUDA 13, not 12.9. This is forced, not chosen: the debian12/sbsa repo
-#     publishes ONLY CUDA 13.1 through 13.4, with no 12.x at all, whereas
-#     debian12/x86_64 carries 12.3 through 13.4. x86-cuda pins 12.9 solely
+#     publishes ONLY CUDA 13.1 through 13.3, with no 12.x at all, whereas
+#     debian12/x86_64 carries 12.3 through 13.3. x86-cuda pins 12.9 solely
 #     because sm_70 (Volta) support ends there; Grace Hopper is sm_90, which
 #     CUDA 13 supports fully, so nothing is lost. CUDA 13 has dropped sm_70
 #     and below entirely -- this image therefore cannot target Volta, by
@@ -92,20 +92,41 @@ RUN gcc_major=$(gcc -dumpversion | cut -d. -f1) && \
 # .../debian12/sbsa/, which is the ARM server repo -- confirmed by
 # unpacking the .deb rather than assumed.
 #
-# Pinned to the 13-4 branch specifically, not the floating
-# `cuda-toolkit`/`cuda` meta-packages, for the same reproducibility reason
-# AMReX/ADIOS2/openPMD below are pinned to exact versions. 13.4 is the
-# newest the sbsa repo carries; 13.1-13.3 are also present if a fallback is
-# ever needed (e.g. an AMReX release that predates a CUDA 13 change).
+# Pinned to 13-3, and NOT to the newest available (13.4), because 13.4
+# regressed argument-dependent lookup for hidden friends and cannot compile
+# CarpetX:
+#
+#   boundaries_impl.hxx(34): error: more than one instance of overloaded
+#   function "all" matches the argument list:
+#       function "all(bool)"          (device_atomic_functions.h)
+#       function "Arith::all(bool)"   (Arith/src/defs.hxx)
+#
+# Arith declares `all(const vect&)` as a hidden friend, findable only by
+# ADL. Up to 13.3 nvcc finds it, it is an exact match, and the two
+# `all(bool)` candidates lose. 13.4 does not find it at all -- with both
+# bool overloads removed it reports `identifier "all" is undefined`, while
+# the same call outside a static_assert compiles. g++ and CUDA 12.9 are
+# fine. Measured against a reduced test case:
+#
+#   g++ 12  ok | 12.9 ok | 13.1 ok | 13.2 ok | 13.3 ok | 13.4 FAILS
+#
+# An earlier attempt interposed a cuda_runtime.h to rename CUDA's
+# deprecated global all()/any() out of the way. That was treating a
+# symptom: it removed one of the two ambiguous candidates and turned the
+# error into "no suitable conversion from vect<bool,3> to bool", because
+# the hidden friend still was not found. Reverted.
+#
+# Not the floating `cuda-toolkit`/`cuda` meta-packages, for the same
+# reproducibility reason AMReX/ADIOS2/openPMD below are pinned exactly.
 # ---------------------------------------------------------------------------
 RUN curl -sSLO https://developer.download.nvidia.com/compute/cuda/repos/debian12/sbsa/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
     apt update -y && \
-    apt install -y cuda-toolkit-13-4 cuda-nsight-systems-13-4 cuda-nsight-compute-13-4 && \
+    apt install -y cuda-toolkit-13-3 cuda-nsight-systems-13-3 cuda-nsight-compute-13-3 && \
     apt clean
 
-ENV PATH=/usr/local/cuda-13.4/bin:${PATH} \
-    LD_LIBRARY_PATH=/usr/local/cuda-13.4/lib64
+ENV PATH=/usr/local/cuda-13.3/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.3/lib64
 
 # Confirm this toolkit really can target Grace Hopper, and really cannot
 # target Volta -- the second half matters because it is the cost of being on
@@ -128,6 +149,18 @@ RUN nvcc --version | tail -2 && \
     test -d /usr/local/cuda/lib64 && \
     ls /usr/local/cuda/lib64/libcurand.so >/dev/null && \
     echo "cuda lib64 -> $(readlink -f /usr/local/cuda/lib64): OK"
+
+# The CarpetX pattern this toolkit must be able to compile. It is why the
+# CUDA version above is pinned to 13.3 rather than the newest available --
+# see that comment. Checked here, early and cheaply, so a toolkit bump that
+# reintroduces the ADL regression fails the image build instead of failing
+# a user's CarpetX compile hours later.
+COPY carpetx-adl-check.cu /opt/cactus-deps/carpetx-adl-check.cu
+RUN set -ex; \
+    nvcc -x cu -std=c++17 -arch=sm_90 \
+        -c /opt/cactus-deps/carpetx-adl-check.cu -o /tmp/adl.o; \
+    rm -f /tmp/adl.o; \
+    echo "carpetx-adl-check: hidden-friend ADL works in this toolkit"
 
 # ---------------------------------------------------------------------------
 # Cactus / Einstein Toolkit ExternalLibraries dependencies -- same scope
@@ -196,7 +229,7 @@ RUN set -ex; \
             -DAMReX_GPU_BACKEND=CUDA \
             -DAMReX_CUDA_ERROR_CAPTURE_THIS=ON \
             -DAMReX_CUDA_ERROR_CROSS_EXECUTION_SPACE_CALL=ON \
-            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.4/bin/nvcc \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.3/bin/nvcc \
             -DCMAKE_CUDA_ARCHITECTURES="$AMREX_CUDA_ARCHS" \
             -DCMAKE_CUDA_FLAGS="-Wno-deprecated-gpu-targets -diag-suppress=20012"; \
         cmake --build "$build/amrex/build" -j"$(nproc)"; \
@@ -256,29 +289,6 @@ RUN set -ex; \
 # Cactus optionlists pointing at the dependencies built/installed above --
 # see the header comment in each file for the full explanation of every
 # setting, and which one to pick for a given HPC site's PMI support.
-# Interposed cuda_runtime.h -- see the header itself for why. CUCCFLAGS
-# names this directory with -I, ahead of CUDA's own headers.
-COPY cuda-compat/cuda_runtime.h /opt/cactus-deps/cuda-compat/cuda_runtime.h
-RUN set -ex; \
-    printf '%s\n' \
-      '#include <cuda_runtime.h>' \
-      'namespace Arith { __host__ __device__ constexpr bool all(bool x){return x;}' \
-      '                  __host__ __device__ constexpr bool any(bool x){return x;} }' \
-      'namespace CarpetX { using namespace Arith;' \
-      '  __host__ __device__ inline void f(){ bool b=true; static_assert(all(true));' \
-      '    (void)all(b); (void)any(b); } }' \
-      '__global__ void k(int *p){ atomicAdd(p,1); CarpetX::f(); }' \
-      > /tmp/ambig.cu; \
-    # Without the interposer this is the CarpetX failure, verbatim:
-    #   error: more than one instance of overloaded function "all" matches
-    if nvcc -x cu -std=c++17 -arch=sm_90 -c /tmp/ambig.cu -o /tmp/ambig.o 2>/dev/null; then \
-        echo "ERROR: the ambiguity did not reproduce; the interposer may be untested" >&2; exit 1; \
-    fi; \
-    nvcc -x cu -std=c++17 -arch=sm_90 -I/opt/cactus-deps/cuda-compat \
-        -c /tmp/ambig.cu -o /tmp/ambig.o; \
-    echo "cuda-compat: CarpetX all()/any() ambiguity resolved, atomicAdd intact"; \
-    rm -f /tmp/ambig.cu /tmp/ambig.o
-
 COPY cactus-arm-cuda-openmpi.cfg /opt/cactus-deps/cactus-arm-cuda-openmpi.cfg
 COPY cactus-arm-cuda-mpich.cfg /opt/cactus-deps/cactus-arm-cuda-mpich.cfg
 
