@@ -256,6 +256,29 @@ RUN set -ex; \
 # Cactus optionlists pointing at the dependencies built/installed above --
 # see the header comment in each file for the full explanation of every
 # setting, and which one to pick for a given HPC site's PMI support.
+# Interposed cuda_runtime.h -- see the header itself for why. CUCCFLAGS
+# names this directory with -I, ahead of CUDA's own headers.
+COPY cuda-compat/cuda_runtime.h /opt/cactus-deps/cuda-compat/cuda_runtime.h
+RUN set -ex; \
+    printf '%s\n' \
+      '#include <cuda_runtime.h>' \
+      'namespace Arith { __host__ __device__ constexpr bool all(bool x){return x;}' \
+      '                  __host__ __device__ constexpr bool any(bool x){return x;} }' \
+      'namespace CarpetX { using namespace Arith;' \
+      '  __host__ __device__ inline void f(){ bool b=true; static_assert(all(true));' \
+      '    (void)all(b); (void)any(b); } }' \
+      '__global__ void k(int *p){ atomicAdd(p,1); CarpetX::f(); }' \
+      > /tmp/ambig.cu; \
+    # Without the interposer this is the CarpetX failure, verbatim:
+    #   error: more than one instance of overloaded function "all" matches
+    if nvcc -x cu -std=c++17 -arch=sm_90 -c /tmp/ambig.cu -o /tmp/ambig.o 2>/dev/null; then \
+        echo "ERROR: the ambiguity did not reproduce; the interposer may be untested" >&2; exit 1; \
+    fi; \
+    nvcc -x cu -std=c++17 -arch=sm_90 -I/opt/cactus-deps/cuda-compat \
+        -c /tmp/ambig.cu -o /tmp/ambig.o; \
+    echo "cuda-compat: CarpetX all()/any() ambiguity resolved, atomicAdd intact"; \
+    rm -f /tmp/ambig.cu /tmp/ambig.o
+
 COPY cactus-arm-cuda-openmpi.cfg /opt/cactus-deps/cactus-arm-cuda-openmpi.cfg
 COPY cactus-arm-cuda-mpich.cfg /opt/cactus-deps/cactus-arm-cuda-mpich.cfg
 
